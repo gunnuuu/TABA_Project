@@ -1,102 +1,234 @@
 package com.example.taba_project.handler;
 
-import com.example.taba_project.handler.FileStorageHandler;
+import com.example.taba_project.model.Image;
+import com.example.taba_project.repository.ImageRepository;
+import com.example.taba_project.repository.InfoRepository;
+import com.example.taba_project.repository.Info2Repository;
+import com.example.taba_project.service.ImageSenderService;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
-import javax.imageio.ImageIO;
-import java.awt.image.BufferedImage;
-import java.io.ByteArrayInputStream;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.time.Instant;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 @Component
 public class ImageWebSocketHandler extends TextWebSocketHandler {
 
-    // 세션별 메시지 조합을 위한 맵
-    private final ConcurrentHashMap<String, StringBuilder> sessionData = new ConcurrentHashMap<>();
+    private static final Logger logger = LoggerFactory.getLogger(ImageWebSocketHandler.class);
+
+    private final ImageRepository imageRepository;
+    private final InfoRepository infoRepository;
+    private final Info2Repository info2Repository;
+    private final ImageSenderService imageSenderService;
+    private final FileStorageHandler fileStorageHandler;
 
     @Value("${file.storage.directory}")
     private String directoryPath;
 
-    // 마지막 chunk 확인 메서드
-    private boolean isLastChunk(String payload) {
-        return payload.endsWith("<END>");
+    private final ConcurrentHashMap<String, ChunkedMessage> sessionChunks = new ConcurrentHashMap<>();
+    private static final long TIMEOUT_SECONDS = 3; // 3초
+    private Instant lastReceivedTime = Instant.now();
+    private boolean isDirectoryDeleted = false;
+
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+
+    @Autowired
+    public ImageWebSocketHandler(ImageRepository imageRepository, InfoRepository infoRepository, Info2Repository info2Repository,
+                                 ImageSenderService imageSenderService,
+                                 FileStorageHandler fileStorageHandler) {
+        this.imageRepository = imageRepository;
+        this.infoRepository = infoRepository;
+        this.info2Repository = info2Repository;
+        this.imageSenderService = imageSenderService;
+        this.fileStorageHandler = fileStorageHandler;
+
+        // 타이머 실행: 주기적으로 이미지 수신 상태 확인
+        scheduler.scheduleAtFixedRate(this::checkAndDeleteFiles, 0, 1, TimeUnit.SECONDS);
     }
 
     @Override
-    public void handleTextMessage(WebSocketSession session, TextMessage message) throws Exception {
-        String payload = message.getPayload();
+    public void handleTextMessage(WebSocketSession session, TextMessage message) {
+        try {
+            String payload = message.getPayload();
+            logger.info("수신한 데이터: {}", payload);
 
-        // 세션별 데이터 조합
-        sessionData.putIfAbsent(session.getId(), new StringBuilder());
-        StringBuilder builder = sessionData.get(session.getId());
-        builder.append(payload);
+            JsonNode jsonNode = new ObjectMapper().readTree(payload);
 
-        // 마지막 청크 확인
-        if (isLastChunk(payload)) {
-            // 데이터 처리
-            String base64EncodedData = builder.toString()
-                    .replace("<END>", "") // 구분자 제거
-                    .replaceAll("\\s", ""); // 공백 제거
+            String sessionId = session.getId();
+            int sequence = jsonNode.get("sequence").asInt();
+            int chunk = jsonNode.get("chunk").asInt();
+            int totalChunks = jsonNode.get("totalChunks").asInt();
+            String data = jsonNode.get("data").asText();
+            boolean isLast = jsonNode.get("isLast").asBoolean();
 
-            // 데이터 처리 후 세션 데이터 초기화
-            sessionData.remove(session.getId());
-            // 조합된 Base64 데이터 출력
-            System.out.println("조합된 Base64 데이터: " + base64EncodedData.substring(0, Math.min(base64EncodedData.length(), 100)) + "...");
-            // Base64 데이터 디코딩 및 처리
-            processBase64Data(base64EncodedData, session);
+            // 청크 데이터 조합
+            sessionChunks.putIfAbsent(sessionId, new ChunkedMessage(sequence, totalChunks));
+            ChunkedMessage chunkedMessage = sessionChunks.get(sessionId);
+            chunkedMessage.addChunk(chunk, data);
+
+            // 마지막 청크인 경우
+            if (isLast) {
+                logger.info("마지막 청크 수신 완료. 데이터 조합 중...");
+                String completeBase64 = chunkedMessage.combineChunks();
+                String mode = jsonNode.get("mode").asText();
+
+                // 모드 정규화
+                mode = normalizeMode(mode);
+
+                processBase64Data(completeBase64, mode);
+                sessionChunks.remove(sessionId); // 조합 완료 후 청크 삭제
+            }
+        } catch (Exception e) {
+            logger.error("메시지 처리 중 오류 발생: {}", e.getMessage());
         }
     }
 
-    private void processBase64Data(String base64EncodedData, WebSocketSession session) {
+    private String normalizeMode(String mode) {
+        if ("대화".equals(mode)) return "chat";
+        if ("이동".equals(mode)) return "move";
+        return mode;
+    }
+
+    private void processBase64Data(String base64Image, String mode) {
         try {
-            // Base64 디코딩
-            byte[] decodedData = java.util.Base64.getDecoder().decode(base64EncodedData);
+            byte[] decodedData = java.util.Base64.getDecoder().decode(base64Image);
 
-            // 디코딩 후 다시 인코딩하여 검증
-            String reEncodedBase64 = java.util.Base64.getEncoder().encodeToString(decodedData);
-            if (!reEncodedBase64.equals(base64EncodedData)) {
-                System.err.println("Base64 데이터 검증 실패: 디코딩 후 다시 인코딩한 데이터가 일치하지 않습니다.");
-                return;
-            }
-            System.out.println("디코딩된 데이터 크기: " + decodedData.length);
+            logger.info("디코딩된 이미지 크기: {} bytes", decodedData.length);
 
-            // 이미지 데이터의 파일 헤더를 확인 -> 유효한 이미지 파일인지 검증 (JPEG 파일 : 'FFD8'로 시작)
+            // 이미지 데이터 검증
             if (decodedData.length < 2 || decodedData[0] != (byte) 0xFF || decodedData[1] != (byte) 0xD8) {
-                System.err.println("유효하지 않은 JPEG 파일.");
-                return;
+                throw new IllegalArgumentException("유효하지 않은 JPEG 파일.");
             }
-
-
-            // 이미지 유효성 검증
-            BufferedImage image = ImageIO.read(new ByteArrayInputStream(decodedData));
-            if (image == null) {
-                System.err.println("이미지 유효성 검증 실패: 유효하지 않은 데이터입니다.");
-                return;
-            }
-            System.out.println("이미지 유효성 검증 성공.");
 
             // 이미지 저장
-            saveImage(decodedData);
+            String fileName = "image_" + System.currentTimeMillis() + ".jpg";
+            String savedFilePath = fileStorageHandler.saveFile(directoryPath, fileName, decodedData);
+            logger.info("이미지 저장 성공: {}", savedFilePath);
+
+            // DB 저장
+            saveImageRecord(savedFilePath);
+
+            // FastAPI로 전송
+            imageSenderService.sendLatestImageToFastApi(mode);
 
         } catch (IllegalArgumentException e) {
-            System.err.println("Base64 디코딩 실패: " + e.getMessage());
-        } catch (Exception e) {
-            System.err.println("이미지 처리 중 오류: " + e.getMessage());
+            logger.error("이미지 데이터 검증 실패: {}", e.getMessage());
+        } catch (IOException e) {
+            logger.error("이미지 저장 중 오류: {}", e.getMessage());
         }
     }
 
-    private void saveImage(byte[] imageData) {
+    private void processCompleteData(String base64Image, String mode) {
         try {
-            String fileName = "image_" + System.currentTimeMillis() + ".jpg";
-            FileStorageHandler FS = new FileStorageHandler();
-            FS.saveFile(directoryPath, fileName, imageData);
-            System.out.println("이미지 저장 성공: " + directoryPath + "/" + fileName);
+            byte[] decodedImage = java.util.Base64.getDecoder().decode(base64Image);
+            logger.info("데이터 크기: {} bytes, 모드: {}", decodedImage.length, mode);
+
+            // 여기서 이미지 저장 및 모드에 따른 추가 작업 수행
+            // 예: 이미지 파일 저장, 데이터베이스 저장 등
         } catch (Exception e) {
-            System.err.println("이미지 저장 실패: " + e.getMessage());
+            logger.error("이미지 처리 중 오류: {}", e.getMessage());
+        }
+    }
+
+    // 청크 데이터를 조합하는 내부 클래스
+    private static class ChunkedMessage {
+        private final int sequence;
+        private final int totalChunks;
+        private final String[] chunks;
+
+        public ChunkedMessage(int sequence, int totalChunks) {
+            this.sequence = sequence;
+            this.totalChunks = totalChunks;
+            this.chunks = new String[totalChunks];
+        }
+
+        public void addChunk(int chunkNumber, String data) {
+            if (chunkNumber > 0 && chunkNumber <= totalChunks) {
+                chunks[chunkNumber - 1] = data;
+            }
+        }
+
+        public String combineChunks() {
+            StringBuilder combinedData = new StringBuilder();
+            for (int i = 0; i < chunks.length; i++) {
+                if (chunks[i] != null) {
+                    logger.info("청크 [{}] : {}", i + 1, chunks[i].length());
+                    combinedData.append(chunks[i]);
+                } else {
+                    logger.error("청크 [{}] 누락됨", i + 1);
+                }
+            }
+            return combinedData.toString();
+        }
+
+    }
+
+    private void saveImageRecord(String filePath) {
+        try {
+            Image image = new Image();
+            image.setUrl(filePath);
+            imageRepository.save(image);
+            logger.info("이미지 URL 데이터베이스 저장 성공: {}", filePath);
+        } catch (Exception e) {
+            logger.error("이미지 URL 데이터베이스 저장 실패: {}", e.getMessage());
+        }
+    }
+
+    // 이미지 디렉토리 및 DB 삭제 로직
+    private void checkAndDeleteFiles() {
+        long secondsSinceLastReceive = Instant.now().getEpochSecond() - lastReceivedTime.getEpochSecond();
+        if (secondsSinceLastReceive > TIMEOUT_SECONDS && !isDirectoryDeleted) {
+            logger.info("3초 이상 이미지 수신 없음. 디렉토리 및 DB 정리 시작...");
+            deleteFilesInDirectory(directoryPath);
+            deleteDatabase();
+            isDirectoryDeleted = true;
+        }
+    }
+
+    // 이미지 디렉토리 삭제 함수
+    private void deleteFilesInDirectory(String directoryPath) {
+        try {
+            java.nio.file.Files.walk(java.nio.file.Paths.get(directoryPath))
+                    .filter(java.nio.file.Files::isRegularFile)
+                    .map(java.nio.file.Path::toFile)
+                    .forEach(file -> {
+                        if (file.delete()) {
+                            logger.info("파일 삭제 성공: {}", file.getAbsolutePath());
+                        } else {
+                            logger.error("파일 삭제 실패: {}", file.getAbsolutePath());
+                        }
+                    });
+        } catch (IOException e) {
+            logger.error("디렉토리 정리 중 오류 발생: {}", e.getMessage());
+        }
+    }
+
+    // DB 데이터 삭제 함수
+    private void deleteDatabase() {
+        try {
+            // image 테이블
+            imageRepository.deleteAll();
+            // info 테이블
+            infoRepository.deleteAll();
+            // info2 테이블
+            info2Repository.deleteAll();
+            logger.info("DB에서 image 테이블의 모든 데이터 삭제 완료");
+        } catch (Exception e) {
+            logger.error("DB 데이터 삭제 중 오류 발생: {}", e.getMessage());
         }
     }
 }
